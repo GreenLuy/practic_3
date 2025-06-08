@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 
 # Загрузка аудиофайла
-audio_path = "/home/artem/Музыка/artem_members.wav"
+audio_path = "/home/artem/Музыка/stix.wav"
 waveform, sample_rate = librosa.load(audio_path, sr=16000)
 
 audio = waveform.reshape(1, -1)  # добавляем размерность батча
