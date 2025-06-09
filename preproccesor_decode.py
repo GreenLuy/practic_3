@@ -7,7 +7,7 @@ class RNNTDecoder:
         self._encoder = rt.InferenceSession(model_files["encoder"], providers=["CPUExecutionProvider"])
         self._decoder_joint = rt.InferenceSession(model_files["decoder_joint"], providers=["CPUExecutionProvider"])
         
-        # Загрузка словаря (вокабуляра)
+        # Загрузка словаря
         self.vocab = self._load_vocab(model_files["vocab"])
         
         # Настройка индексов специальных токенов
@@ -51,8 +51,8 @@ class RNNTDecoder:
     def _print_model_info(self):
         # Печать информации о загруженном словаре
         print(f"Loaded vocabulary with {len(self.vocab)} tokens")
-        print(f"First 10 tokens: {self.vocab[:10]}")
-        print(f"Last 10 tokens: {self.vocab[-10:]}")
+        # print(f"First 10 tokens: {self.vocab[:10]}")
+        # print(f"Last 10 tokens: {self.vocab[-10:]}")
         print(f"Blank index: {self._blank_idx} ('{self.vocab[self._blank_idx]}')")
         print(f"UNK index: {self._unk_idx} ('{self.vocab[self._unk_idx]}')")
         print(f"Max vocab index: {self._max_vocab_idx}")
@@ -81,6 +81,13 @@ class RNNTDecoder:
                 "input_states_2": prev_state[1],
             }
         )
+        # print("Decoder output shapes:")
+        # print(f"outputs shape: {outputs.shape}")
+        # print(f"state1 shape: {state1.shape}")
+        # print(f"state2 shape: {state2.shape}")
+        # print(f"outputs dtype: {outputs.dtype}")
+        # print(f"state1 dtype: {state1.dtype}")
+        # print(f"state2 dtype: {state2.dtype}")
         return np.squeeze(outputs), -1, (state1, state2)
 
     def greedy_search(self, encoder_out, encoder_out_len):
@@ -129,7 +136,7 @@ class RNNTDecoder:
                 if len(hyp) >= 2 and hyp[-1] == next_token and hyp[-2] == next_token:
                     continue
                 hyp.append(next_token)
-
+        print("tensors: ", hyp)
         return self._postprocess(hyp)
 
     def _postprocess(self, decoded_ids):
@@ -172,6 +179,7 @@ class RNNTDecoder:
 
 class rnnt_nemo():
     def __init__(self, model_files=None):
+        # Базовые параметры
         self.sample_rate = 16000
         self.n_fft = 512
         self.win_length = 400
@@ -179,6 +187,19 @@ class rnnt_nemo():
         self.preemph = 0.97
         self.n_mels = 80
         self.log_zero_guard_value = float(2**-24)
+        self.dither = 1.0e-05
+        self.frame_splicing = 1
+
+        # Логирование конфигурации
+        print("\nPreprocessor configuration:")
+        print(f"Sample rate: {self.sample_rate}")
+        print(f"Window size: {self.win_length} samples ({self.win_length/self.sample_rate:.3f} seconds)")
+        print(f"Window stride: {self.hop_length} samples ({self.hop_length/self.sample_rate:.3f} seconds)")
+        print(f"N_fft: {self.n_fft}")
+        print(f"N_mels: {self.n_mels}")
+        print(f"Preemph: {self.preemph}")
+        print(f"Dither: {self.dither}")
+        print(f"Frame splicing: {self.frame_splicing}")
 
         # Initialize Hann window
         self.hann_window = self._create_hann_window()
@@ -189,9 +210,15 @@ class rnnt_nemo():
 
         # Initialize decoder if model files are provided
         if model_files:
-            self.decoder = RNNTDecoder(model_files)
+            try:
+                self.decoder = RNNTDecoder(model_files)
+                print("\nDecoder initialized successfully")
+            except Exception as e:
+                print(f"\nError initializing decoder: {e}")
+                raise
         else:
             self.decoder = None
+            print("\nWarning: No model files provided, decoder not initialized")
 
     def mel_scale_fbanks(self, n_fft, f_min, f_max, n_mels, sample_rate):
         # Преобразование частоты в мел-частоту
@@ -221,7 +248,7 @@ class rnnt_nemo():
         return filters
 
     def _normalize(self, features, features_lens):
-        """Нормализация признаков по времени"""
+        """Нормализация признаков по признаку (per_feature)"""
         batch_size, n_mels, max_frames = features.shape
         normalized_features = np.zeros_like(features)
         
@@ -229,10 +256,11 @@ class rnnt_nemo():
             seq_len = int(features_lens[b])
             if seq_len > 0:
                 sequence = features[b, :, :seq_len]
-                mean = np.mean(sequence, axis=1, keepdims=True)
-                var = np.var(sequence, axis=1, keepdims=True, ddof=1)
-                normalized_sequence = (sequence - mean) / (np.sqrt(var) + 1e-5)
-                normalized_features[b, :, :seq_len] = normalized_sequence
+                # Нормализация по каждому признаку отдельно
+                for m in range(n_mels):
+                    mean = np.mean(sequence[m])
+                    var = np.var(sequence[m], ddof=1)
+                    normalized_features[b, m, :seq_len] = (sequence[m] - mean) / (np.sqrt(var) + 1e-5)
         
         return normalized_features
 
@@ -296,7 +324,7 @@ class rnnt_nemo():
 
     def _compute_mel_spectrogram(self, spectrogram):
         """Вычисление мел-спектрограммы"""
-        mel_spectrogram = np.matmul(spectrogram.transpose(0, 2, 1), self.mel_filters_80.T)
+        mel_spectrogram = np.matmul(spectrogram.transpose(0, 2, 1), self.mel_filters_80.T)  # Возвращаем к mel_filters_80
         return mel_spectrogram.transpose(0, 2, 1)
 
     def _log_mel_spectrogram(self, mel_spectrogram):
@@ -305,28 +333,83 @@ class rnnt_nemo():
 
     def get_features(self, waveforms, waveforms_lens):
         """Основная функция предобработки"""
-        # 1. Предыскажение
-        waveforms = self._preemphasis(waveforms)
+        try:
+            # Проверка входных данных
+            if waveforms is None or waveforms_lens is None:
+                raise ValueError("Input waveforms or lengths cannot be None")
+            
+            if not isinstance(waveforms, np.ndarray):
+                raise TypeError("Waveforms must be numpy array")
+            
+            if waveforms.ndim != 2:
+                raise ValueError(f"Expected 2D array for waveforms, got {waveforms.ndim}D")
+            
+            if waveforms.shape[0] != len(waveforms_lens):
+                raise ValueError(f"Batch size mismatch: waveforms {waveforms.shape[0]} != lengths {len(waveforms_lens)}")
+
+            # 1. Добавляем дизеринг
+            if self.dither > 0:
+                waveforms = waveforms + np.random.normal(0, self.dither, waveforms.shape)
+            
+            # 2. Предыскажение
+            waveforms = self._preemphasis(waveforms)
+            
+            # 3. Паддинг
+            waveforms = self._pad_waveforms(waveforms)
+            
+            # 4. STFT
+            spectrogram = self._stft(waveforms)
+            
+            # 5. Мел-спектрограмма
+            mel_spectrogram = self._compute_mel_spectrogram(spectrogram)
+            
+            # 6. Логарифм
+            log_mel_spectrogram = self._log_mel_spectrogram(mel_spectrogram)
+            
+            # 7. Вычисление длин признаков
+            features_lens = waveforms_lens // self.hop_length + 1
+            
+            # 8. Нормализация (теперь per_feature)
+            normalized_features = self._normalize(log_mel_spectrogram, features_lens)
+            
+            # 9. Frame splicing (если нужно)
+            if self.frame_splicing > 1:
+                normalized_features = self._frame_splicing(normalized_features, features_lens)
+            
+            return normalized_features, features_lens
+
+        except Exception as e:
+            print(f"\nError in get_features: {e}")
+            raise
+
+    def _frame_splicing(self, features, features_lens):
+        """Применение frame splicing"""
+        batch_size, n_mels, max_frames = features.shape
+        spliced_features = []
+        spliced_lens = []
         
-        # 2. Паддинг
-        waveforms = self._pad_waveforms(waveforms)
+        for b in range(batch_size):
+            seq_len = int(features_lens[b])
+            if seq_len > 0:
+                sequence = features[b, :, :seq_len]
+                # Создаем окна размера frame_splicing
+                windows = []
+                for i in range(0, seq_len - self.frame_splicing + 1):
+                    window = sequence[:, i:i + self.frame_splicing].flatten()
+                    windows.append(window)
+                spliced = np.stack(windows, axis=1)
+                spliced_features.append(spliced)
+                spliced_lens.append(len(windows))
         
-        # 3. STFT
-        spectrogram = self._stft(waveforms)
+        # Находим максимальную длину
+        max_len = max(spliced_lens)
         
-        # 4. Мел-спектрограмма
-        mel_spectrogram = self._compute_mel_spectrogram(spectrogram)
+        # Паддинг до максимальной длины
+        padded_features = np.zeros((batch_size, n_mels * self.frame_splicing, max_len))
+        for b in range(batch_size):
+            padded_features[b, :, :spliced_lens[b]] = spliced_features[b]
         
-        # 5. Логарифм
-        log_mel_spectrogram = self._log_mel_spectrogram(mel_spectrogram)
-        
-        # 6. Вычисление длин признаков
-        features_lens = waveforms_lens // self.hop_length + 1
-        
-        # 7. Нормализация
-        normalized_features = self._normalize(log_mel_spectrogram, features_lens)
-        
-        return normalized_features, features_lens
+        return padded_features
 
     def transcribe(self, audio, audio_len):
         """
@@ -337,20 +420,41 @@ class rnnt_nemo():
         Returns:
             str: распознанный текст
         """
-        if self.decoder is None:
-            raise ValueError("Decoder not initialized. Please provide model_files in constructor.")
+        try:
+            if self.decoder is None:
+                raise ValueError("Decoder not initialized. Please provide model_files in constructor.")
 
-        # 1. Извлечение признаков
-        features, features_lens = self.get_features(audio, audio_len)
+            # Проверка входных данных
+            if audio is None or audio_len is None:
+                raise ValueError("Input audio or lengths cannot be None")
+            
+            if not isinstance(audio, np.ndarray):
+                raise TypeError("Audio must be numpy array")
+            
+            if audio.ndim != 2:
+                raise ValueError(f"Expected 2D array for audio, got {audio.ndim}D")
+            
+            if audio.shape[0] != len(audio_len):
+                raise ValueError(f"Batch size mismatch: audio {audio.shape[0]} != lengths {len(audio_len)}")
 
-        # 2. Преобразование в float32 для ONNX
-        features = features.astype(np.float32)
-        features_lens = features_lens.astype(np.int64)
+            # 1. Извлечение признаков
+            features, features_lens = self.get_features(audio, audio_len)
 
-        # 3. Получение выходов энкодера
-        encoder_out, encoder_out_len = self.decoder._encode(features, features_lens)
+            # 2. Преобразование в float32 для ONNX
+            features = features.astype(np.float32)
+            features_lens = features_lens.astype(np.int64)
 
-        # 4. Декодирование в текст
-        text = self.decoder.greedy_search(encoder_out, encoder_out_len)
+            # 3. Получение выходов энкодера
+            encoder_out, encoder_out_len = self.decoder._encode(features, features_lens)
 
-        return text
+            print("\nEncoder output shape:", encoder_out.shape)
+            print("Encoder output lengths:", encoder_out_len)
+
+            # 4. Декодирование в текст
+            text = self.decoder.greedy_search(encoder_out, encoder_out_len)
+
+            return text
+
+        except Exception as e:
+            print(f"\nError in transcribe: {e}")
+            raise
